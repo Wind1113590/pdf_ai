@@ -19,7 +19,7 @@ public class RedisChatMemoryStore implements ChatMemoryStore {
 
     @Override
     public List<ChatMessage> getMessages(Object memoryId) {
-        String json = stringRedisTemplate.opsForValue().get(memoryId);
+        String json = stringRedisTemplate.opsForValue().get(String.valueOf(memoryId));
         List<ChatMessage> chatMessages = ChatMessageDeserializer.messagesFromJson(json);//反序列化为消息上下文
         return chatMessages;
     }
@@ -27,11 +27,11 @@ public class RedisChatMemoryStore implements ChatMemoryStore {
     @Override
     public void updateMessages(Object memoryId, List<ChatMessage> list) {
         String json = ChatMessageSerializer.messagesToJson(list);//序列化成json
-        stringRedisTemplate.opsForValue().set(memoryId.toString(),json, Duration.ofDays(1));
+        stringRedisTemplate.opsForValue().set(String.valueOf(memoryId), json, Duration.ofDays(1));
     }
 
     @Override
     public void deleteMessages(Object memoryId) {
-        stringRedisTemplate.delete(memoryId.toString());
+        stringRedisTemplate.delete(String.valueOf(memoryId));
     }
 }

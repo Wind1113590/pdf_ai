@@ -5,13 +5,13 @@ import com.huang.pdf_ai.entity.PdfChunk;
 import com.huang.pdf_ai.entity.PdfDocument;
 import com.huang.pdf_ai.mapper.PdfChunkMapper;
 import com.huang.pdf_ai.mapper.PdfDocumentMapper;
-import dev.langchain4j.community.store.embedding.redis.RedisEmbeddingStore;
 import dev.langchain4j.data.document.Document;
 import dev.langchain4j.data.document.DocumentSplitter;
 import dev.langchain4j.data.document.Metadata;
 import dev.langchain4j.data.embedding.Embedding;
 import dev.langchain4j.data.segment.TextSegment;
 import dev.langchain4j.model.embedding.EmbeddingModel;
+import dev.langchain4j.store.embedding.EmbeddingStore;
 import org.apache.pdfbox.pdmodel.PDDocument;
 import org.apache.pdfbox.text.PDFTextStripper;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -19,17 +19,16 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.io.File;
-import java.io.FileInputStream;
+import java.net.URL;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
-import java.util.UUID;
 
 @Service
 public class PdfParseService {
 
     @Autowired
-    private RedisEmbeddingStore redisEmbeddingStore;
+    private EmbeddingStore<TextSegment> qdrantEmbeddingStore;
     @Autowired
     private EmbeddingModel embeddingModel;
     @Autowired
@@ -45,20 +44,22 @@ public class PdfParseService {
      * 解析PDF、分页、分块、存MySQL、Redis向量
      */
     @Transactional
-    public void parseSinglePdf(String pdfPath, Long userId) {
+    public void parseSinglePdf(String pdfPath,
+                               Long userId,
+                               String originalFilename,  // 原始文件名
+                               Long fileSize             // 真实文件大小
+                                ) {
         // 1. 插入PDF主表元数据
-        File file = new File(pdfPath);
-
         PdfDocument pdfDocument = new PdfDocument();
         pdfDocument.setUserId(userId);
-        pdfDocument.setName(file.getName());
+        pdfDocument.setName(originalFilename);
         pdfDocument.setFilePath(pdfPath);
-        pdfDocument.setFileSize(file.length());
+        pdfDocument.setFileSize(fileSize);
         pdfDocument.setParseStatus(0);
 
         // ===================== 只加载一次 PDF =====================
         // try-with-resources 自动关闭，最安全
-        try (PDDocument pdDocument = PDDocument.load(file)) {
+        try (PDDocument pdDocument = PDDocument.load(new URL(pdfPath).openStream())) {
 
             // ===================== 阶段1：获取总页数 =====================
             int totalPages;
@@ -77,10 +78,15 @@ public class PdfParseService {
             List<Document> pageDocuments = new ArrayList<>();
             try {
                 PDFTextStripper stripper = new PDFTextStripper();
-                for (int pageNum = 1; pageNum <= totalPages; pageNum++) {
+                for (int pageNum = 1; pageNum <= 5; pageNum++) {
                     stripper.setStartPage(pageNum);
                     stripper.setEndPage(pageNum);
                     String pageText = stripper.getText(pdDocument);
+
+                    if (pageText.isBlank() || pageText.length() < 20) {
+                        System.out.println("⚠️ 跳过第 " + pageNum + " 页（无文字/图片页）");
+                        continue;
+                    }
 
                     Document pageDocument = Document.from(
                             pageText,
@@ -119,9 +125,10 @@ public class PdfParseService {
                     // 3.2 构建带pdf_id元数据的文本段（检索隔离）
                     TextSegment segment = TextSegment.from(chunkText, metadata);
 
+
                     // 3.3 文本段与对应的数字向量存入Redis
                     Embedding embedding = embeddingModel.embed(segment).content();
-                    String vectorId = redisEmbeddingStore.add(embedding, segment);
+                    String vectorId = qdrantEmbeddingStore.add(embedding, segment);
 
                     // 3.4 保存数字向量ID（用于删除pdf）
                     pdfChunk.setVectorId(vectorId);
@@ -140,6 +147,7 @@ public class PdfParseService {
         }
 
     }
+
     /**
      * 删除PDF + 对应Redis向量
      */
@@ -150,7 +158,7 @@ public class PdfParseService {
         );
         for (PdfChunk chunk : chunkList) { //根据数字向量ID删 redis对应向量
             if (chunk.getVectorId() != null) {
-                redisEmbeddingStore.remove(chunk.getVectorId());
+                qdrantEmbeddingStore.remove(chunk.getVectorId());
             }
         }
 
@@ -158,4 +166,7 @@ public class PdfParseService {
         pdfChunkMapper.delete(new LambdaQueryWrapper<PdfChunk>().eq(PdfChunk::getPdfId, pdfId));
         pdfDocumentMapper.deleteById(pdfId);
     }
+
+
+
 }
