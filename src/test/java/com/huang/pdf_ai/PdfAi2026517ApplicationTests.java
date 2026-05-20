@@ -1,5 +1,6 @@
 package com.huang.pdf_ai;
 
+import com.huang.pdf_ai.service.AiChatManageService;
 import com.huang.pdf_ai.service.AiChatService;
 import com.huang.pdf_ai.service.PdfParseService;
 import org.junit.jupiter.api.Test;
@@ -13,18 +14,25 @@ class PdfAi2026517ApplicationTests {
     PdfParseService pdfParseService;
 
     @Autowired
-    AiChatService aiChatService;
+    AiChatManageService aiChatManageService;
+
 
     @Test
     void testPdfParse() {
-        pdfParseService.parseSinglePdf("D:\\项目\\pdf-ai_2026-5-17\\src\\main\\resources\\pdfs\\菜品介绍.pdf", 1L);
+        //pdfParseService.parseSinglePdf("D:\\项目\\pdf-ai_2026-5-17\\src\\main\\resources\\pdfs\\Harry Potter and the Chamber of - J.K. Rowling.pdf", 1L);
     }
 
     @Test
-    void testDeletePdf(){
+    void testDeletePdf() {
         pdfParseService.deletePdf(2L);
     }
 
+    @Test
+    void testAiChat() throws InterruptedException {
+        aiChatManageService.chatWithPdf(1L, 4L, "不用回答我什么");
+
+        Thread.sleep(1000);
+    }
 
 
 }
