@@ -8,24 +8,39 @@ import com.huang.pdf_ai.result.Result;
 import com.huang.pdf_ai.service.PdfParseService;
 import com.huang.pdf_ai.util.AliOssUtil;
 import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.data.redis.core.RedisTemplate;
 import org.springframework.web.bind.annotation.*;
 import org.springframework.web.multipart.MultipartFile;
 
 import java.io.IOException;
 import java.util.UUID;
+import java.util.concurrent.TimeUnit;
+
+import static com.huang.pdf_ai.service.PdfParseService.PARSE_PENDING;
+import static com.huang.pdf_ai.service.PdfParseService.PARSE_PROCESSING;
 
 @RestController
 @RequestMapping("/api/pdf")
 @RequiredArgsConstructor
+@Slf4j
 public class PdfController {
 
     @Autowired
     private final PdfParseService pdfParseService;
+
     @Autowired
     private final PdfDocumentMapper pdfDocumentMapper;
+
     @Autowired
     private final AliOssUtil aliOssUtil;
+
+    @Autowired
+    private RedisTemplate<String, String> redisTemplate;   // 新增 Redis
+
+    // Redis key 前缀
+    private static final String PARSE_STATUS_KEY = "pdf:parse:status:";
 
     /**
      * 1.1 OSS上传PDF + 自动解析
@@ -35,29 +50,21 @@ public class PdfController {
             @RequestParam("file") MultipartFile file,
             @RequestParam("userId") Long userId
     ) {
-        try {
-            // 1. OSS 上传（完全沿用你原来的写法）
-            String originalFilename = file.getOriginalFilename();
-            String extension = originalFilename.substring(originalFilename.lastIndexOf("."));
-            String objectName = "pdf/" + UUID.randomUUID() + extension;
+        PdfDocument pdfDocument = new PdfDocument();
+        pdfDocument.setUserId(userId);
+        pdfDocument.setName(file.getOriginalFilename());
+        pdfDocument.setFileSize(file.getSize());
+        pdfDocument.setParseStatus(PARSE_PENDING);
+        pdfDocument.setTotalPages(0); // 临时，后面更新
+        pdfDocumentMapper.insert(pdfDocument);
 
-            // 上传到阿里云OSS
-            String ossFilePath = aliOssUtil.upload(file.getBytes(), objectName);
+        Long pdfId = pdfDocument.getId();
+        setParseStatus(pdfId, PARSE_PROCESSING);
 
-            // 2. 调用你的解析Service（传入OSS地址即可）
-            pdfParseService.parseSinglePdf(ossFilePath, userId,originalFilename,file.getSize());
+        // 2. 调用你的解析Service（传入OSS地址即可）
+        pdfParseService.parseSinglePdf(file,pdfId);
 
-            // 3. 返回刚插入的PDF ID
-            PdfDocument pdfDocument = pdfDocumentMapper.selectOne(
-                    Wrappers.lambdaQuery(PdfDocument.class)
-                            .eq(PdfDocument::getFilePath, ossFilePath)
-            );
-
-            return Result.ok("PDF上传解析中", pdfDocument.getId());
-
-        } catch (IOException e) {
-            return Result.fail("PDF上传失败：" + e.getMessage());
-        }
+        return Result.ok("PDF上传解析中", pdfDocument.getId());
     }
 
     /**
@@ -93,5 +100,13 @@ public class PdfController {
     public Result<Void> delete(@PathVariable Long pdfId) {
         pdfParseService.deletePdf(pdfId);
         return Result.ok();
+    }
+
+    /**
+     * 设置 Redis 解析状态（带过期时间）
+     */
+    private void setParseStatus(Long pdfId, int status) {
+        String key = PARSE_STATUS_KEY + pdfId;
+        redisTemplate.opsForValue().set(key, String.valueOf(status), 10, TimeUnit.MINUTES);
     }
 }

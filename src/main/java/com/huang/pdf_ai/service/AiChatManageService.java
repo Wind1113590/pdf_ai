@@ -12,6 +12,7 @@ import dev.langchain4j.store.embedding.filter.Filter;
 import lombok.RequiredArgsConstructor;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
 import reactor.core.publisher.Flux;
 
 
@@ -54,7 +55,8 @@ public class AiChatManageService {
      * @param question  问题
      * @return 流式回答
      */
-    //@Transactional
+    //@Transactional//主线程加事务无法给到新的线程（threadLocal），后面因为引入了线程池查数据库保证一致性，事务相当于失效，所以调用线程池的方法需要额外加事务
+    //这里加了也没用，因为事务天生无法夸线程，一个事务就是一个连接，就应该属于一个线程
     public Flux<String> chatWithPdf(Long sessionId, Long userId, String question) {
         // 1. 获取会话绑定的PDF
         AiChatSession session = aiChatSessionMapper.selectById(sessionId);
@@ -142,7 +144,7 @@ public class AiChatManageService {
         return responseFlux
                 .doOnNext(part -> fullAnswer.set(fullAnswer.get() + part))
                 .doFinally(signalType -> {
-                    chatDbExecutor.execute(() -> {
+                    chatDbExecutor.execute(() -> {//这里其实和@Async + Transactional(Requires.NEW)差不多
                             aiChatMessageTxService.saveChatMessage(sessionId,userId,question,fullAnswer.get(),retrievalContent,pageNums);
                     });
                 });
