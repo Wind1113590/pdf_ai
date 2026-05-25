@@ -34,9 +34,6 @@ public class PdfController {
     private final PdfDocumentMapper pdfDocumentMapper;
 
     @Autowired
-    private final AliOssUtil aliOssUtil;
-
-    @Autowired
     private RedisTemplate<String, String> redisTemplate;   // 新增 Redis
 
     // Redis key 前缀
@@ -76,12 +73,16 @@ public class PdfController {
             @RequestParam(defaultValue = "1") Integer pageNum,
             @RequestParam(defaultValue = "10") Integer pageSize
     ) {
+
         Page<PdfDocument> page = new Page<>(pageNum, pageSize);
+        long now = System.currentTimeMillis();
         Page<PdfDocument> pdfPage = pdfDocumentMapper.selectPage(page,
                 Wrappers.lambdaQuery(PdfDocument.class)
                         .eq(PdfDocument::getUserId, userId)
                         .orderByDesc(PdfDocument::getCreateTime)
         );
+         long useTime = System.currentTimeMillis() - now;
+         log.info("查找list列表耗时：" + useTime);
         return Result.ok(pdfPage);
     }
 
