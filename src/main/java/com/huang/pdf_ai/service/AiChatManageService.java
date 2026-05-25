@@ -68,6 +68,8 @@ public class AiChatManageService {
         //搞了半天，redis不支持meta过滤
         Filter filter = metadataKey("pdf_id").isEqualTo(bindPdfId.toString());
 
+
+        /*
         // 2. 构建【只检索当前PDF】的检索器（核心：pdf_id过滤）
         EmbeddingStoreContentRetriever retriever = EmbeddingStoreContentRetriever.builder()
                 .embeddingStore(qdrantEmbeddingStore)
@@ -76,12 +78,13 @@ public class AiChatManageService {
                 .maxResults(3)
                 .minScore(0.5)
                 .build();
+        */
 
         // 3. 手动检索，获取【原文 + 页码】
         List<Content> contentList;
 
         try {
-            contentList = retriever.retrieve(Query.from(question));
+            contentList = hybridRetrieve(question, filter, 3);
         } catch (Exception e) {//这里后面可以自定义一个检索异常
             // 检索异常兜底：直接让大模型回答，不返回错误
             Flux<String> responseFlux = aiChatService.chat(sessionId, "用户问题：" + question + "\n提示：未找到相关文档内容，请基于通用知识回答");
@@ -148,6 +151,61 @@ public class AiChatManageService {
                             aiChatMessageTxService.saveChatMessage(sessionId,userId,question,fullAnswer.get(),retrievalContent,pageNums);
                     });
                 });
+    }
+
+    /**
+     * 混合检索：向量检索 + 关键词（TF-IDF）融合，使用 RRF 排序
+     */
+    private List<Content> hybridRetrieve(String question, Filter filter, int topK) {
+        // 1. 向量检索获取更多候选（例如 topK * 3）
+        EmbeddingStoreContentRetriever vectorRetriever = EmbeddingStoreContentRetriever.builder()
+                .embeddingStore(qdrantEmbeddingStore)
+                .embeddingModel(embeddingModel)
+                .filter(filter)
+                .maxResults(topK * 3)
+                .minScore(0.5)
+                .build();
+        List<Content> vectorResults = vectorRetriever.retrieve(Query.from(question));
+        if (vectorResults.isEmpty()) return Collections.emptyList();
+
+        // 2. 关键词打分（基于文本中问题词的出现次数，简单但有效）
+        String[] queryWords = question.toLowerCase().split("\\W+");
+        Map<Content, Integer> keywordScores = new HashMap<>();// key-content value-score
+        for (Content content : vectorResults) {
+            String text = content.textSegment().text().toLowerCase();
+            int score = 0;
+            for (String word : queryWords) {
+                if (word.length() < 2) continue;
+                int index = -1;
+                while ((index = text.indexOf(word, index + 1)) != -1) score++;
+            }
+            keywordScores.put(content, score);//词频计数
+        }
+
+        // 3. RRF 融合排序（倒数排名融合，k=60）
+        Map<Content, Double> rrfScores = new HashMap<>();
+
+        // 向量排名权重
+        for (int i = 0; i < vectorResults.size(); i++) {
+            Content c = vectorResults.get(i);
+            double rrf = 1.0 / (60 + i + 1);//i+1 代表排名，这里算初始向量检索的排名的分数
+            rrfScores.merge(c, rrf, Double::sum);
+        }
+        // 关键词排名权重
+        List<Content> sortedByKeyword = new ArrayList<>(vectorResults);//再复制一份用于关键词排名
+        sortedByKeyword.sort((a, b) -> keywordScores.get(b) - keywordScores.get(a));//原本的向量作为key去取关键词词频统计，根据词频统计算排名，降序
+        for (int i = 0; i < sortedByKeyword.size(); i++) {
+            Content c = sortedByKeyword.get(i);
+            double rrf = 1.0 / (60 + i + 1);//算词频排名分数
+            rrfScores.merge(c, rrf, Double::sum);
+        }
+
+        // 按融合分数排序取 topK
+        return rrfScores.entrySet().stream()
+                .sorted(Map.Entry.<Content, Double>comparingByValue().reversed())//降序
+                .limit(topK)//取分数最高的前topK个
+                .map(Map.Entry::getKey)
+                .collect(Collectors.toList());
     }
 
 }
