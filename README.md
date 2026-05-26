@@ -1,6 +1,6 @@
 # PDF AI 智能问答系统
 
-基于 LangChain4j + Qdrant + Redis + MySQL 的 PDF 问答系统，支持语义检索与 RAG 混合排名。**代码在dev分支上。**
+基于 LangChain4j + Qdrant + Redis + MySQL 的 PDF 问答系统，支持语义检索与 RAG 混合排名。
 
 ## 技术栈
 
@@ -209,6 +209,7 @@ ai:
     access-key-secret: ${ai.alioss.access-key-secret}
     bucket-name: ${ai.alioss.bucket-name}
 ```
+---
 
 ## 贡献与许可
 本项目遵循 MIT 协议，欢迎提交 Issue 或 PR。
