@@ -2,6 +2,7 @@ package com.huang.pdf_ai.controller;
 
 import com.baomidou.mybatisplus.core.toolkit.Wrappers;
 import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
+import com.huang.pdf_ai.dto.ParseStatusMessage;
 import com.huang.pdf_ai.entity.PdfDocument;
 import com.huang.pdf_ai.mapper.PdfDocumentMapper;
 import com.huang.pdf_ai.result.Result;
@@ -61,7 +62,7 @@ public class PdfController {
         // 2. 调用你的解析Service（传入OSS地址即可）
         pdfParseService.parseSinglePdf(file,pdfId);
 
-        return Result.ok("PDF上传解析中", pdfDocument.getId());
+        return Result.ok(pdfId);
     }
 
     /**
@@ -109,5 +110,15 @@ public class PdfController {
     private void setParseStatus(Long pdfId, int status) {
         String key = PARSE_STATUS_KEY + pdfId;
         redisTemplate.opsForValue().set(key, String.valueOf(status), 10, TimeUnit.MINUTES);
+    }
+
+    @GetMapping("/parse-status/{pdfId}")
+    public Result<ParseStatusMessage> getParseStatus(@PathVariable Long pdfId) {
+        PdfDocument doc = pdfDocumentMapper.selectById(pdfId);
+        ParseStatusMessage msg = new ParseStatusMessage();
+        msg.setPdfId(pdfId);
+        msg.setStatus(doc.getParseStatus());
+        msg.setTotalPages(doc.getTotalPages());
+        return Result.ok(msg);
     }
 }

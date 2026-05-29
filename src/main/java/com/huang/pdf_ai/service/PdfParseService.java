@@ -2,6 +2,7 @@ package com.huang.pdf_ai.service;
 
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.huang.pdf_ai.document.PdfChunkDocument;
+import com.huang.pdf_ai.dto.ParseStatusMessage;
 import com.huang.pdf_ai.entity.PdfChunk;
 import com.huang.pdf_ai.entity.PdfDocument;
 import com.huang.pdf_ai.mapper.PdfChunkMapper;
@@ -22,6 +23,7 @@ import org.apache.pdfbox.pdmodel.PDDocument;
 import org.apache.pdfbox.text.PDFTextStripper;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.data.redis.core.RedisTemplate;
+import org.springframework.messaging.simp.SimpMessagingTemplate;
 import org.springframework.scheduling.annotation.Async;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -54,6 +56,8 @@ public class PdfParseService {
     private RedisTemplate<String, String> redisTemplate;   // 新增 Redis
     @Autowired
     private TransactionTemplate transactionTemplate;       // 编程式事务
+    @Autowired
+    private SimpMessagingTemplate messagingTemplate;
 
     @Autowired
     private PdfChunkEsRepository pdfChunkEsRepository;
@@ -73,6 +77,20 @@ public class PdfParseService {
     private static final String PARSE_STATUS_KEY = "pdf:parse:status:";
 
     /**
+     * 推送状态到前端
+     */
+    private void pushStatus(Long pdfId, int status, String message, Integer totalPages) {
+        ParseStatusMessage statusMsg = new ParseStatusMessage();
+        statusMsg.setPdfId(pdfId);
+        statusMsg.setStatus(status);
+        statusMsg.setMessage(message);
+        statusMsg.setTotalPages(totalPages);
+        // 发送到 /topic/parse-status/{pdfId}
+        messagingTemplate.convertAndSend("/topic/parse-status/" + pdfId, statusMsg);
+    }
+
+
+    /**
      * 异步解析 PDF（对外公开方法）
      * 责状态流转，优先写redis减少数据库IO操作，有效减少前端响应时间，通过编程式事务高效地添加事务（而不是Transactional这样毫无意义可能还会让已经插入但未解析的数据回滚）
      */
@@ -84,6 +102,7 @@ public class PdfParseService {
             String objectName = "pdf/" + UUID.randomUUID() + extension;
             String pdfPath = aliOssUtil.upload(file.getBytes(), objectName);
             // 3. 耗时操作：在事务外执行（不占数据库连接）
+            pushStatus(pdfId, PARSE_PROCESSING, "开始解析PDF...", null);
             List<PageContent> pages = extractPages(pdfPath);// 耗时 PDF 解析
             if (pages.isEmpty()) throw new RuntimeException("无文本");
 
@@ -112,9 +131,11 @@ public class PdfParseService {
             pdfDocument2.setId(pdfId);
             pdfDocument2.setParseStatus(PARSE_SUCCESS);
             pdfDocumentMapper.updateById(pdfDocument2);
+            pushStatus(pdfId, PARSE_SUCCESS, "解析完成", TOTAL_PAGES);
 
         } catch (Exception e) {
             log.error("PDF 解析失败，pdfId: {}", pdfId, e);
+            pushStatus(pdfId, PARSE_FAILED, "解析失败：" + e.getMessage(), null);
             // 更新状态为 FAILED
             if (pdfId != null) {
                 setParseStatus(pdfId, PARSE_FAILED);
@@ -192,6 +213,10 @@ public class PdfParseService {
                 qdrantEmbeddingStore.remove(chunk.getVectorId());
             }
         }
+
+        // 删除 Elasticsearch 中的文档（按 pdfId 批量删除）
+        pdfChunkEsRepository.deleteByPdfId(pdfId);
+
         // 删除 MySQL 记录
         pdfChunkMapper.delete(new LambdaQueryWrapper<PdfChunk>().eq(PdfChunk::getPdfId, pdfId));
         pdfDocumentMapper.deleteById(pdfId);
