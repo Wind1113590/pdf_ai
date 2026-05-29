@@ -1,7 +1,12 @@
 package com.huang.pdf_ai.service;
 
+import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.huang.pdf_ai.entity.AiChatSession;
+import com.huang.pdf_ai.entity.BM25Result;
+import com.huang.pdf_ai.entity.PdfChunk;
 import com.huang.pdf_ai.mapper.AiChatSessionMapper;
+import com.huang.pdf_ai.mapper.PdfChunkMapper;
+import dev.langchain4j.data.document.Metadata;
 import dev.langchain4j.data.segment.TextSegment;
 import dev.langchain4j.model.embedding.EmbeddingModel;
 import dev.langchain4j.rag.content.Content;
@@ -10,9 +15,9 @@ import dev.langchain4j.rag.query.Query;
 import dev.langchain4j.store.embedding.EmbeddingStore;
 import dev.langchain4j.store.embedding.filter.Filter;
 import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
-import org.springframework.transaction.annotation.Transactional;
 import reactor.core.publisher.Flux;
 
 
@@ -25,11 +30,14 @@ import static dev.langchain4j.store.embedding.filter.MetadataFilterBuilder.metad
 
 @Service
 @RequiredArgsConstructor
+@Slf4j
 public class AiChatManageService {
 
     @Autowired
     private AiChatService aiChatService;
     @Autowired AiChatMessageTxService aiChatMessageTxService;
+    @Autowired
+    private BM25SearchService bm25SearchService;
 
     @Autowired
     private EmbeddingStore<TextSegment> qdrantEmbeddingStore;
@@ -39,6 +47,9 @@ public class AiChatManageService {
     // 你的mapper
     @Autowired
     private AiChatSessionMapper aiChatSessionMapper;
+    @Autowired
+    private PdfChunkMapper pdfChunkMapper;
+
 
 
     @Autowired
@@ -66,7 +77,7 @@ public class AiChatManageService {
             return Flux.just("请先选择一个PDF");
         }
         //搞了半天，redis不支持meta过滤
-        Filter filter = metadataKey("pdf_id").isEqualTo(bindPdfId.toString());
+        //Filter filter = metadataKey("pdf_id").isEqualTo(bindPdfId.toString());
 
 
         /*
@@ -82,9 +93,11 @@ public class AiChatManageService {
 
         // 3. 手动检索，获取【原文 + 页码】
         List<Content> contentList;
+        List<TextSegment> segments;
 
         try {
-            contentList = hybridRetrieve(question, filter, 3);
+//            contentList = hybridRetrieve(question, filter, 3);
+            segments = hybridRetrieveBM25(question,bindPdfId,3);
         } catch (Exception e) {//这里后面可以自定义一个检索异常
             // 检索异常兜底：直接让大模型回答，不返回错误
             Flux<String> responseFlux = aiChatService.chat(sessionId, "用户问题：" + question + "\n提示：未找到相关文档内容，请基于通用知识回答");
@@ -102,14 +115,14 @@ public class AiChatManageService {
                     });
         }
 
-        if (contentList.isEmpty()) {
-            return Flux.just("未在当前PDF中找到相关内容，请换个问题试试");
-        }
-
-
-        List<TextSegment> segments = contentList.stream()
-                .map(Content::textSegment)
-                .toList();
+//        if (contentList.isEmpty()) {
+//            return Flux.just("未在当前PDF中找到相关内容，请换个问题试试");
+//        }
+//
+//
+//        List<TextSegment> segments = contentList.stream()
+//                .map(Content::textSegment)
+//                .toList();
 
         String retrievalContent = segments.stream()
                 .map(TextSegment::text)
@@ -205,6 +218,76 @@ public class AiChatManageService {
                 .sorted(Map.Entry.<Content, Double>comparingByValue().reversed())//降序
                 .limit(topK)//取分数最高的前topK个
                 .map(Map.Entry::getKey)
+                .collect(Collectors.toList());
+    }
+
+    private List<TextSegment> hybridRetrieveBM25(String question, Long pdfId, int topK) {
+        // 1. 向量检索，取 3*topK 候选
+        List<TextSegment> vectorSegments = vectorRetrieve(question, pdfId, topK * 3);
+        if (vectorSegments.isEmpty()) {
+            return Collections.emptyList();
+        }
+
+        // 2. BM25 检索，同样取 3*topK 候选
+        List<BM25Result> bm25Results = bm25SearchService.search(question, pdfId, topK * 3);
+
+        // 3. 建立内容 → TextSegment 的快速查找表（来自向量结果）因为BM25Result里面只有content，我们还需要metadata，直接用原本检索的文本块即可
+        Map<String, TextSegment> contentMap = new HashMap<>();
+        for (TextSegment seg : vectorSegments) {
+            contentMap.put(seg.text(), seg);
+        }
+
+        // 4. 将 BM25 结果按顺序转换为 TextSegment（理论上都在 contentMap 中）
+        List<TextSegment> bm25Segments = new ArrayList<>();
+        for (BM25Result br : bm25Results) {
+            TextSegment seg = contentMap.get(br.getContent());
+            if (seg != null) {
+                bm25Segments.add(seg);
+            } else {
+                // 极端情况：向量检索没召回（例如 minScore 阈值过滤掉了），可降级用内容临时构造
+                // 但为了简洁，直接跳过（通常不会发生）
+                log.warn("BM25 结果中内容未在向量召回中找到: {}", br.getContent());
+            }
+        }
+
+        // 5. RRF 融合
+        int K = 60;
+        Map<TextSegment, Double> rrfScores = new HashMap<>();
+
+        for (int i = 0; i < vectorSegments.size(); i++) {
+            double score = 1.0 / (K + i + 1);
+            rrfScores.merge(vectorSegments.get(i), score, Double::sum);
+        }
+
+        for (int i = 0; i < bm25Segments.size(); i++) {
+            double score = 1.0 / (K + i + 1);
+            rrfScores.merge(bm25Segments.get(i), score, Double::sum);
+        }
+
+        // 6. 取 topK 个返回
+        return rrfScores.entrySet().stream()
+                .sorted(Map.Entry.<TextSegment, Double>comparingByValue().reversed())
+                .limit(topK)
+                .map(Map.Entry::getKey)
+                .collect(Collectors.toList());
+    }
+
+    private List<TextSegment> vectorRetrieve(String question, Long pdfId, int topK) {
+        // 构建过滤器
+        Filter filter = (pdfId != null) ? metadataKey("pdf_id").isEqualTo(pdfId.toString()) : null;
+
+        EmbeddingStoreContentRetriever retriever = EmbeddingStoreContentRetriever.builder()
+                .embeddingStore(qdrantEmbeddingStore)
+                .embeddingModel(embeddingModel)
+                .filter(filter)
+                .maxResults(topK)
+                .minScore(0.5)
+                .build();
+        List<Content> contents = retriever.retrieve(Query.from(question));
+
+        // 提取 TextSegment
+        return contents.stream()
+                .map(Content::textSegment)
                 .collect(Collectors.toList());
     }
 

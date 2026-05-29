@@ -1,10 +1,12 @@
 package com.huang.pdf_ai.service;
 
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
+import com.huang.pdf_ai.document.PdfChunkDocument;
 import com.huang.pdf_ai.entity.PdfChunk;
 import com.huang.pdf_ai.entity.PdfDocument;
 import com.huang.pdf_ai.mapper.PdfChunkMapper;
 import com.huang.pdf_ai.mapper.PdfDocumentMapper;
+import com.huang.pdf_ai.repository.PdfChunkEsRepository;
 import com.huang.pdf_ai.util.AliOssUtil;
 import dev.langchain4j.data.document.Document;
 import dev.langchain4j.data.document.DocumentSplitter;
@@ -54,6 +56,9 @@ public class PdfParseService {
     private TransactionTemplate transactionTemplate;       // 编程式事务
 
     @Autowired
+    private PdfChunkEsRepository pdfChunkEsRepository;
+
+    @Autowired
     AliOssUtil aliOssUtil;
 
     // 状态常量
@@ -83,7 +88,7 @@ public class PdfParseService {
             if (pages.isEmpty()) throw new RuntimeException("无文本");
 
             // 4. 耗时操作：分块 + 向量化 + 组装 chunk（不占数据库连接）
-            List<PdfChunk> chunkList = buildChunks(pdfId, pages);     // 内部做分块、向量化、Qdrant 存储
+            List<PdfChunk> chunkList = buildChunks1(pdfId, pages);     // 内部做分块、向量化、Qdrant 存储
 
             PdfDocument pdfDocument1 = new PdfDocument();
             pdfDocument1.setFilePath(pdfPath);
@@ -203,18 +208,17 @@ public class PdfParseService {
     }
 
     // text->chunk(segment)将分块、向量化、Qdrant 存储抽离出来，返回组装好的 chunk 列表（不操作 MySQL）最小的颗粒度应该就是文本块，带pdf_id和page
-    private List<PdfChunk> buildChunks(Long pdfId, List<PageContent> pages) {
+    private List<PdfChunk> buildChunks0(Long pdfId, List<PageContent> pages) {
         List<PdfChunk> chunkList = new ArrayList<>();
         int chunkIndex = 0;
         for (PageContent page : pages) {
-            Document doc = Document.from(page.getText(), Metadata.metadata("page", String.valueOf(page.getPageNum())));
+            Document doc = Document.from(page.getText());
             List<TextSegment> segments = documentSplitter.split(doc);//一页文本 -> 很多文本块
             for (TextSegment segment : segments) {//每块都插一条sql
                 Metadata metadata = new Metadata();
                 metadata.put("page", String.valueOf(page.getPageNum()));
                 metadata.put("pdf_id", String.valueOf(pdfId));
                 TextSegment enrichedSegment = TextSegment.from(segment.text(), metadata);//带元数据的文本块
-
                 Embedding embedding = embeddingModel.embed(enrichedSegment).content();
                 String vectorId = qdrantEmbeddingStore.add(embedding, enrichedSegment);
 
@@ -225,6 +229,44 @@ public class PdfParseService {
                 chunk.setPageNum(page.getPageNum());
                 chunk.setVectorId(vectorId);
                 chunkList.add(chunk);
+            }
+        }
+        return chunkList;
+    }
+
+    private List<PdfChunk> buildChunks1(Long pdfId, List<PageContent> pages) {
+        List<PdfChunk> chunkList = new ArrayList<>();
+        int chunkIndex = 0;
+        for (PageContent page : pages) {
+            Document doc = Document.from(page.getText(), Metadata.metadata("page", String.valueOf(page.getPageNum())));
+            List<TextSegment> segments = documentSplitter.split(doc);
+            for (TextSegment segment : segments) {
+                // 1. 向量化 + Qdrant 存储
+                Metadata metadata = new Metadata();
+                metadata.put("page", String.valueOf(page.getPageNum()));
+                metadata.put("pdf_id", String.valueOf(pdfId));
+                TextSegment enrichedSegment = TextSegment.from(segment.text(), metadata);
+                Embedding embedding = embeddingModel.embed(enrichedSegment).content();
+                String vectorId = qdrantEmbeddingStore.add(embedding, enrichedSegment);
+
+
+                // 2. 构建 PDF 分块记录（MySQL）
+                PdfChunk chunk = new PdfChunk();
+                chunk.setPdfId(pdfId);
+                chunk.setChunkIndex(chunkIndex++);
+                chunk.setContent(segment.text());
+                chunk.setPageNum(page.getPageNum());
+                chunk.setVectorId(vectorId);
+                chunkList.add(chunk);
+
+                // 3. 同步写入 Elasticsearch（用于 BM25 检索）
+                PdfChunkDocument esDoc = new PdfChunkDocument();
+                esDoc.setId(vectorId);  // 复用 vectorId 作为 ES 文档 ID，便于删除
+                esDoc.setPdfId(pdfId);
+                esDoc.setChunkIndex(chunk.getChunkIndex());
+                esDoc.setPageNum(page.getPageNum());
+                esDoc.setContent(segment.text());
+                pdfChunkEsRepository.save(esDoc);
             }
         }
         return chunkList;

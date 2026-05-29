@@ -21,8 +21,15 @@ public class EmbeddingStoreConfig {
                 .build();
     }
 
-    @Bean
+    /*@Bean
     DocumentSplitter documentSplitter() {
         return DocumentSplitters.recursive(500, 100);
+    }
+
+     */
+
+    @Bean
+    DocumentSplitter documentSplitter() {
+        return DocumentSplitters.recursive(75, 0);
     }
 }
